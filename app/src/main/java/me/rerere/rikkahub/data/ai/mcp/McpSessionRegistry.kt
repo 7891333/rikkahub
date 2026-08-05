@@ -45,6 +45,8 @@ private const val TAG = "McpSessionRegistry"
 private const val MAX_RECONNECT_ATTEMPTS = 5
 private const val BASE_RECONNECT_DELAY_MS = 1000L
 private const val MAX_RECONNECT_DELAY_MS = 30000L
+private const val MCP_TOOL_MAX_RETRIES = 2
+private const val MCP_TOOL_RETRY_DELAY_MS = 1000L
 
 /** 单个 MCP Server 的全部运行时状态。 */
 private class McpSession(initialConfig: McpServerConfig) {
@@ -149,21 +151,62 @@ internal class McpSessionRegistry(
             ?: throw McpClientUnavailableException("MCP client $serverId is not connected")
         val config = session.connectedConfig ?: session.config
         Log.i(TAG, "Calling tool $toolName on $serverId (${config.commonOptions.name})")
-        return try {
-            sdkClient.callTool(
-                request = CallToolRequest(
-                    params = CallToolRequestParams(name = toolName, arguments = args),
-                ),
-                options = RequestOptions(timeout = 120.seconds),
-            )
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            if (oauthCoordinator.needsAuthorization(config, e)) {
-                statusStore.update(config.id, McpStatus.NeedsAuthorization)
-            }
-            throw e
+
+        // 工具调用超时：使用每个 MCP Server 的配置（可 null 表示不超时）
+        val timeoutSeconds = config.commonOptions.toolCallTimeoutSeconds
+        val options = if (timeoutSeconds != null) {
+            RequestOptions(timeout = timeoutSeconds.seconds)
+        } else {
+            RequestOptions()
         }
+
+        // MCP 工具调用自动重试（临时性错误：超时/网络/5xx）
+        var attempt = 0
+        while (true) {
+            try {
+                return sdkClient.callTool(
+                    request = CallToolRequest(
+                        params = CallToolRequestParams(name = toolName, arguments = args),
+                    ),
+                    options = options,
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (oauthCoordinator.needsAuthorization(config, e)) {
+                    statusStore.update(config.id, McpStatus.NeedsAuthorization)
+                }
+                attempt++
+                if (attempt > MCP_TOOL_MAX_RETRIES || !isRetryableMcpError(e)) throw e
+                Log.w(TAG, "MCP tool $toolName failed (${e.message}), retry $attempt/$MCP_TOOL_MAX_RETRIES")
+                delay(MCP_TOOL_RETRY_DELAY_MS * attempt)
+            }
+        }
+    }
+
+    /** 判断 MCP 工具调用错误是否可重试（临时性错误）。 */
+    private fun isRetryableMcpError(e: Throwable): Boolean {
+        if (e is CancellationException) return false
+        val msg = e.message ?: e.javaClass.simpleName ?: ""
+        // 明确的不可重试错误
+        if (msg.contains("401") || msg.contains("403") || msg.contains("unauthorized") ||
+            msg.contains("invalid") || msg.contains("not found") || msg.contains("404") ||
+            msg.contains("400") || msg.contains("Bad Request")
+        ) return false
+        // 临时性/可重试错误
+        if (msg.contains("timeout") || msg.contains("timed out") ||
+            msg.contains("429") || msg.contains("Too Many Requests") ||
+            msg.contains("502") || msg.contains("503") || msg.contains("504") ||
+            msg.contains("500") || msg.contains("upstream") ||
+            msg.contains("connection") || msg.contains("reset") ||
+            msg.contains("socket") || msg.contains("EOF") ||
+            msg.contains("Unavailable") || msg.contains("unavailable")
+        ) return true
+        if (e is java.io.IOException) return true
+        if (e is java.net.SocketTimeoutException) return true
+        if (e is java.net.ConnectException) return true
+        // 默认不重试
+        return false
     }
 
     suspend fun addClient(configInput: McpServerConfig) {
