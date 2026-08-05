@@ -90,6 +90,8 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.uuid.Uuid
 
 private const val TAG = "ChatService"
+// 流式生成时的节流持久化间隔（毫秒）：太频繁会卡数据库，太稀疏异常时丢得多
+private const val PERSIST_INTERVAL_MS = 500L
 
 internal fun backgroundTextGenerationParams(
     model: Model,
@@ -179,6 +181,9 @@ class ChatService(
     fun clearAllErrors() {
         _errors.value = emptyList()
     }
+
+    // 流式持久化节流：记录每个会话上次落库时间，避免每 chunk 都写数据库
+    private val lastPersistTime = ConcurrentHashMap<Uuid, Long>()
 
     // 生成完成流
     private val _generationDoneFlow = MutableSharedFlow<Uuid>()
@@ -586,6 +591,7 @@ class ChatService(
                     updateAt = Instant.now()
                 )
                 updateConversation(conversationId, updatedConversation)
+                saveConversation(conversationId, updatedConversation)
 
                 // 生成结束：取消 Live Update 通知，后台时发送完成通知
                 appEventBus.emit(
@@ -603,6 +609,11 @@ class ChatService(
                             .updateCurrentMessages(chunk.messages)
                         updateConversation(conversationId, updatedConversation)
 
+                        // 【修复】流式实时持久化（节流）：后台任务期间切走/异常时，
+                        // 已生成的输出不会丢失（之前只更新内存，onSuccess 才落库，
+                        // API 异常时 onFailure 不保存 -> 输出被吞）
+                        maybePersistConversation(conversationId, updatedConversation)
+
                         // 通知等边缘副作用由 ChatNotificationManager 消费；
                         // tryEmit 不挂起，事件丢失只影响单次通知更新，不能反压生成链
                         chunk.messages.lastOrNull()?.let { lastMessage ->
@@ -616,6 +627,17 @@ class ChatService(
         }.onFailure {
             // 兜底取消 Live Update 通知（生成开始前失败时 onCompletion 不会执行）
             appEventBus.tryEmit(AppEvent.ChatGenerationEnded(conversationId, senderName, null))
+
+            // 【修复】异常时先强制保存当前已累积的输出（含已生成的 AI 回复、
+            // 已执行的工具结果），避免后台任务失败后历史被吞掉只能重发
+            runCatching {
+                val current = getConversationFlow(conversationId).value
+                saveConversation(conversationId, current)
+            }.onFailure { saveErr ->
+                Log.w(TAG, "saveConversation on failure failed: ${saveErr.message}", saveErr)
+            }
+            // 重置节流计时，避免下一次生成被旧时间戳影响
+            lastPersistTime.remove(conversationId)
 
             it.printStackTrace()
             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
@@ -973,6 +995,24 @@ class ChatService(
         if (deletedFiles.isNotEmpty()) {
             filesManager.deleteChatFiles(deletedFiles)
             Log.w(TAG, "checkFilesDelete: $deletedFiles")
+        }
+    }
+
+    /**
+     * 流式生成时的节流持久化。
+     * 每次调用检查距离上次落库是否超过 PERSIST_INTERVAL_MS，避免高频写库。
+     * 若会话已被删除/不存在则跳过。
+     */
+    private suspend fun maybePersistConversation(conversationId: Uuid, conversation: Conversation) {
+        val now = System.currentTimeMillis()
+        val last = lastPersistTime[conversationId] ?: 0L
+        if (now - last >= PERSIST_INTERVAL_MS) {
+            lastPersistTime[conversationId] = now
+            runCatching {
+                saveConversation(conversationId, conversation)
+            }.onFailure { e ->
+                Log.w(TAG, "maybePersistConversation failed: ${e.message}", e)
+            }
         }
     }
 
