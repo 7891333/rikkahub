@@ -555,7 +555,11 @@ class ChatCompletionsAPI(
                 else -> false
             }
         }
-        val hasReasoning = !reasoningPart?.reasoning.isNullOrBlank()
+        // 【修复】只要这条 assistant 消息存在 reasoning 部分，就必须原样回传
+        // reasoning_content 字段。DeepSeek 等 thinking 模型要求历史消息的
+        // reasoning_content 必须完整回传；若因流式中断/截断导致 reasoning 为空，
+        // 仍需带上字段（空字符串），否则报 "reasoning_content ... must be passed back"
+        val hasReasoning = reasoningPart != null
         if (!hasUsableContent && !hasReasoning && tools.isEmpty()) {
             return null
         }
@@ -563,9 +567,9 @@ class ChatCompletionsAPI(
         return buildJsonObject {
             put("role", "assistant")
 
-            // reasoning_content
-            if (hasReasoning) {
-                put("reasoning_content", reasoningPart.reasoning)
+            // reasoning_content：存在 reasoning 部分就必须回传（含空串），thinking 模型强制要求
+            if (reasoningPart != null) {
+                put("reasoning_content", reasoningPart.reasoning ?: "")
             }
 
             // content
