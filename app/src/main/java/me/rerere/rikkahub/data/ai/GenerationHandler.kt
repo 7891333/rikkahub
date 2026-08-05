@@ -4,10 +4,12 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.Serializable
@@ -36,6 +38,8 @@ import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
 import me.rerere.rikkahub.data.files.FileFolders
 import java.io.File
+import java.io.IOException
+import java.net.SocketTimeoutException
 import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
@@ -53,6 +57,8 @@ import kotlin.uuid.Uuid
 
 private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
+private const val MAX_AI_RETRIES = 3
+private const val AI_RETRY_BASE_DELAY_MS = 1000L
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
 
 @Serializable
@@ -280,8 +286,15 @@ class GenerationHandler(
                                 ?: error("Tool ${tool.toolName} not found")
                             val args = runCatching {
                                 json.parseToJsonElement(tool.input.ifBlank { "{}" })
-                            }.getOrElse {
-                                error("Invalid tool arguments JSON for ${tool.toolName}: ${it.message}")
+                            }.getOrElse { parseErr ->
+                                // 【修复】工具参数 JSON 不完整/损坏时，给出明确指令让模型
+                                // 重新生成完整参数，而不是只抛一个含糊的错误
+                                error(
+                                    "Tool arguments JSON is INVALID or INCOMPLETE for tool '${tool.toolName}' " +
+                                        "(${parseErr.message}). The arguments were likely truncated during streaming. " +
+                                        "Please re-issue this tool call with COMPLETE, well-formed JSON arguments. " +
+                                        "Raw input received (first 500 chars): ${tool.input.take(500)}"
+                                )
                             }
                             Log.i(TAG, "generateText: executing tool ${toolDef.name} with args: $args")
                             val result = toolDef.execute(args)
@@ -342,6 +355,63 @@ class GenerationHandler(
         }
 
     }.flowOn(Dispatchers.IO)
+
+
+    /**
+     * 判断 AI API 调用错误是否可重试（临时性错误）。
+     * 可重试：网络 IO、HTTP 5xx、429 限流、连接重置、超时、上游临时故障。
+     * 不可重试：CancellationException、参数错误(400)、鉴权(401/403)、模型不存在等。
+     */
+    private fun isRetryableAiError(e: Throwable): Boolean {
+        if (e is CancellationException) return false
+        val msg = e.message ?: e.javaClass.simpleName ?: ""
+        // 明确的不可重试错误
+        if (msg.contains("invalid_request_error") ||
+            msg.contains("authentication_error") ||
+            msg.contains("permission_denied") ||
+            msg.contains("model_not_found") ||
+            msg.contains("context_length_exceeded") ||
+            msg.contains("invalid_api_key") ||
+            msg.contains("Insufficient Balance") ||
+            msg.contains("insufficient_quota") ||
+            msg.contains("invalid tool arguments") ||
+            msg.contains("Invalid tool arguments") ||
+            msg.contains("must be passed back to the API") ||
+            msg.contains("400") && msg.contains("Bad Request") ||
+            msg.contains("401") || msg.contains("403") ||
+            msg.contains("404") && msg.contains("not found")
+        ) return false
+        // 明确的临时性/可重试错误
+        if (msg.contains("timeout") || msg.contains("timed out") ||
+            msg.contains("Too Many Requests") || msg.contains("429") ||
+            msg.contains("rate limit") || msg.contains("Rate limit") ||
+            msg.contains("upstream") || msg.contains("Upstream") ||
+            msg.contains("502") || msg.contains("503") || msg.contains("504") ||
+            msg.contains("500") || msg.contains("service unavailable") ||
+            msg.contains("temporarily") || msg.contains("overloaded") ||
+            msg.contains("busy") || msg.contains("connection") ||
+            msg.contains("ECONNRESET") || msg.contains("Connection reset") ||
+            msg.contains("reset by peer") || msg.contains("socket") ||
+            msg.contains("Unexpected end") || msg.contains("StreamReset") ||
+            msg.contains("EOF") || msg.contains("eof")
+        ) {
+            return true
+        }
+        // 网络/IO 异常可重试
+        if (e is IOException) return true
+        if (e is SocketTimeoutException) return true
+        if (e is java.net.ConnectException) return true
+        if (e is java.net.UnknownHostException) return true
+        // 默认：未知异常不重试，避免掩盖真正的逻辑错误
+        return false
+    }
+
+    private fun aiRetryDelayMillis(attempt: Int): Long {
+        // 指数退避 + 轻微抖动: 1s, 2s, 4s
+        val base = AI_RETRY_BASE_DELAY_MS * (1L shl attempt)
+        val jitter = (Math.random() * 300).toLong()
+        return base + jitter
+    }
 
     private suspend fun generateInternal(
         assistant: Assistant,
@@ -420,7 +490,16 @@ class GenerationHandler(
                 providerSetting = provider,
                 messages = internalMessages,
                 params = params
-            ).collect {
+            ).retryWhen { cause, attempt ->
+                // AI API 临时性异常自动重试（最多 MAX_AI_RETRIES 次，指数退避）
+                if (attempt >= MAX_AI_RETRIES || !isRetryableAiError(cause)) {
+                    false
+                } else {
+                    Log.w(TAG, "AI streamText error (${cause.message}), retry ${attempt + 1}/$MAX_AI_RETRIES")
+                    delay(aiRetryDelayMillis(attempt))
+                    true
+                }
+            }.collect {
                 messages = messages.handleMessageChunk(chunk = it, model = model)
                 it.usage?.let { usage ->
                     messages = messages.mapIndexed { index, message ->
@@ -434,11 +513,26 @@ class GenerationHandler(
                 onUpdateMessages(messages)
             }
         } else {
-            val chunk = providerImpl.generateText(
-                providerSetting = provider,
-                messages = internalMessages,
-                params = params,
-            )
+            // 非流式：AI API 临时性异常自动重试（最多 MAX_AI_RETRIES 次，指数退避）
+            var chunk: me.rerere.ai.ui.MessageChunk
+            var attempt = 0
+            while (true) {
+                try {
+                    chunk = providerImpl.generateText(
+                        providerSetting = provider,
+                        messages = internalMessages,
+                        params = params,
+                    )
+                    break
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    attempt++
+                    if (attempt > MAX_AI_RETRIES || !isRetryableAiError(e)) throw e
+                    Log.w(TAG, "AI generateText error (${e.message}), retry $attempt/$MAX_AI_RETRIES")
+                    delay(aiRetryDelayMillis(attempt - 1))
+                }
+            }
             messages = messages.handleMessageChunk(chunk = chunk, model = model)
             chunk.usage?.let { usage ->
                 messages = messages.mapIndexed { index, message ->
