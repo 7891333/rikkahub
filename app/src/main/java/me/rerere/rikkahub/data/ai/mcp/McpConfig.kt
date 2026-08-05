@@ -12,6 +12,8 @@ data class McpCommonOptions(
     val headers: List<Pair<String, String>> = emptyList(),
     val tools: List<McpTool> = emptyList(),
     val oauth: McpOAuthState? = null,
+    // 工具调用超时（秒），默认 120；null 表示不超时（完全交给 MCP 端）
+    val toolCallTimeoutSeconds: Long? = 120,
 )
 
 /**
