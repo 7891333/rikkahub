@@ -496,7 +496,7 @@ class GenerationHandler(
                     false
                 } else {
                     Log.w(TAG, "AI streamText error (${cause.message}), retry ${attempt + 1}/$MAX_AI_RETRIES")
-                    delay(aiRetryDelayMillis(attempt))
+                    delay(aiRetryDelayMillis(attempt.toInt()))
                     true
                 }
             }.collect {
